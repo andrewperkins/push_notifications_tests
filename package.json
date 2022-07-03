@@ -1,0 +1,15 @@
+{
+    "name": "notification_app_spikes",
+    "version": "1.0.0",
+    "description": "spikes for notification app",
+    "main": "index.js",
+    "scripts": {
+        "test": "echo \"Error: no test specified\" && exit 1",
+        "push": "npm run start --workspace=push_notifications"
+    },
+    "author": "Andrew Perkins",
+    "license": "ISC",
+    "workspaces": [
+        "push_notifications"
+    ]
+}
