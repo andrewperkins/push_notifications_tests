@@ -10,6 +10,10 @@
     "author": "Andrew Perkins",
     "license": "ISC",
     "workspaces": [
-        "push_notifications"
-    ]
+        "push_notifications",
+        "webauthn"
+    ],
+    "devDependencies": {
+        "nodemon": "^2.0.19"
+    }
 }
