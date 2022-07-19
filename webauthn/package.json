@@ -19,9 +19,8 @@
     },
     "homepage": "https://github.com/andrewperkins/push_notifications_tests#readme",
     "dependencies": {
-        "base64url": "^3.0.1",
+        "@simplewebauthn/server": "^5.3.0",
         "body-parser": "^1.20.0",
-        "cbor": "^8.1.0",
         "cookie-parser": "^1.4.6",
         "cookie-session": "^2.0.0",
         "cors": "^2.8.5",

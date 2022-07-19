@@ -5,9 +5,23 @@ const cors = require('cors');
 const cookieSession = require('cookie-session');
 const cookieParser = require('cookie-parser');
 const crypto = require('crypto');
-const utils = require('./utils');
+const {
+    generateRegistrationOptions,
+    verifyRegistrationResponse,
+} = require('@simplewebauthn/server');
 
-let database = {};
+const inMemoryUserDeviceDB = {
+    // [loggedInUserId]: {
+    //   id: loggedInUserId,
+    //   username: `user@${rpID}`,
+    //   devices: [],
+    //   currentChallenge: undefined,
+    // },
+};
+
+const rpName = 'Perkins SSO';
+const rpID = 'localhost';
+const origin = 'http://localhost:8000';
 
 const app = express();
 app.use(bodyParser.json());
@@ -28,100 +42,109 @@ app.get('/', function (req, res) {
     res.sendFile(path.join(__dirname, '/index.html'));
 });
 
-app.get('/register', function (req, res) {
-    let username = req.body.username;
+app.get('/generate-registration-options', function (req, res) {
+    let input_username = req.body.username;
+    const id = crypto.randomUUID();
+    console.log(id);
 
-    database[username] = {
-        name: username,
-        registered: false,
-        id: utils.randomBase64URLBuffer(),
-        authenticators: [],
+    inMemoryUserDeviceDB[id] = {
+        id: crypto.randomUUID(),
+        username: `${input_username}@${rpID}`,
+        devices: [],
+        currentChallenge: undefined,
     };
 
-    let challengeMakeCred = utils.generateServerMakeCredRequest(
-        username,
-        database[username].id
-    );
-    challengeMakeCred.status = 'ok';
+    user = inMemoryUserDeviceDB[id];
 
-    req.session.challenge = challengeMakeCred.challenge;
-    req.session.username = username;
+    const { username, devices } = user;
 
-    res.json(challengeMakeCred);
+    const options = generateRegistrationOptions({
+        rpName,
+        rpID,
+        userID: id,
+        userName: username,
+        timeout: 60000,
+        attestationType: 'none',
+        /**
+         * Passing in a user's list of already-registered authenticator IDs here prevents users from
+         * registering the same device multiple times. The authenticator will simply throw an error in
+         * the browser if it's asked to perform registration when one of these ID's already resides
+         * on it.
+         */
+        excludeCredentials: devices.map((dev) => ({
+            id: dev.credentialID,
+            type: 'public-key',
+            transports: dev.transports,
+        })),
+        /**
+         * The optional authenticatorSelection property allows for specifying more constraints around
+         * the types of authenticators that users to can use for registration
+         */
+        authenticatorSelection: {
+            userVerification: 'required',
+            residentKey: 'required',
+        },
+        /**
+         * Support the two most common algorithms: ES256, and RS256
+         */
+        supportedAlgorithmIDs: [-7, -257],
+    });
+
+    inMemoryUserDeviceDB[id].currentChallenge = options.challenge;
+    req.session.id = id;
+
+    res.send(options);
 });
 
-app.get('/register_final', function (req, res) {
-    if (
-        !req.body ||
-        !req.body.id ||
-        !req.body.rawId ||
-        !req.body.response ||
-        !req.body.type ||
-        req.body.type !== 'public-key'
-    ) {
-        res.json({
-            status: 'failed',
-            message:
-                'Response missing one or more of id/rawId/response/type fields, or type is not public-key!',
-        });
+app.post('/verify-registration', async function (req, res) {
+    const { body } = req;
 
-        return;
+    const id = req.session.id;
+
+    const user = inMemoryUserDeviceDB[id];
+    // (Pseudocode) Get `options.challenge` that was saved above
+    const expectedChallenge = user.currentChallenge;
+
+    let verification;
+    try {
+        const opts = {
+            credential: body,
+            expectedChallenge: `${expectedChallenge}`,
+            expectedOrigin: 'http://localhost:8000',
+            expectedRPID: rpID,
+            requireUserVerification: true,
+        };
+        verification = await verifyRegistrationResponse(opts);
+    } catch (error) {
+        const _error = error;
+        console.error(_error);
+        return res.status(400).send({ error: _error.message });
     }
 
-    let webauthnResp = req.body;
-    let clientData = JSON.parse(
-        base64url.decode(webauthnResp.response.clientDataJSON)
-    );
+    const { verified, registrationInfo } = verification;
 
-    /* Check challenge... */
-    if (clientData.challenge !== req.session.challenge) {
-        res.json({
-            status: 'failed',
-            message: "Challenges don't match!",
-        });
-    }
+    if (verified && registrationInfo) {
+        const { credentialPublicKey, credentialID, counter } = registrationInfo;
 
-    /* ...and origin */
-    if (clientData.origin !== config.origin) {
-        response.json({
-            status: 'failed',
-            message: "Origins don't match!",
-        });
-    }
-
-    let result;
-    if (webauthnResp.response.attestationObject !== undefined) {
-        /* This is create cred */
-        result = utils.verifyAuthenticatorAttestationResponse(webauthnResp);
-
-        if (result.verified) {
-            database[request.session.username].authenticators.push(
-                result.authrInfo
-            );
-            database[request.session.username].registered = true;
-        }
-    } else if (webauthnResp.response.authenticatorData !== undefined) {
-        /* This is get assertion */
-        result = utils.verifyAuthenticatorAssertionResponse(
-            webauthnResp,
-            database[request.session.username].authenticators
+        const existingDevice = user.devices.find((device) =>
+            device.credentialID.equals(credentialID)
         );
-    } else {
-        res.json({
-            status: 'failed',
-            message: 'Can not determine type of response!',
-        });
+
+        if (!existingDevice) {
+            /**
+             * Add the returned device to the user's list of devices
+             */
+            const newDevice = {
+                credentialPublicKey,
+                credentialID,
+                counter,
+                transports: body.transports,
+            };
+            user.devices.push(newDevice);
+        }
     }
 
-    if (result.verified) {
-        req.session.loggedIn = true;
-        res.json({ status: 'ok' });
-    } else {
-        res.json({
-            status: 'failed',
-            message: 'Can not authenticate signature!',
-        });
-    }
+    res.send({ verified });
 });
 
 app.listen(8000);
