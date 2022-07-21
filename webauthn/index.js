@@ -5,19 +5,16 @@ const cors = require('cors');
 const cookieSession = require('cookie-session');
 const cookieParser = require('cookie-parser');
 const crypto = require('crypto');
+const base64url = require('base64url');
 const {
     generateRegistrationOptions,
     verifyRegistrationResponse,
+    generateAuthenticationOptions,
+    verifyAuthenticationResponse,
 } = require('@simplewebauthn/server');
 
-const inMemoryUserDeviceDB = {
-    // [loggedInUserId]: {
-    //   id: loggedInUserId,
-    //   username: `user@${rpID}`,
-    //   devices: [],
-    //   currentChallenge: undefined,
-    // },
-};
+const inMemoryUserDeviceDB = {};
+const inMemoryCredentialDB = {};
 
 const rpName = 'Perkins SSO';
 const rpID = 'localhost';
@@ -33,7 +30,7 @@ app.use(
         keys: [crypto.randomBytes(32).toString('hex')],
 
         // Cookie Options
-        maxAge: 24 * 60 * 60 * 1000, // 24 hours
+        maxAge: 0.5 * 60 * 60 * 1000, // 30 minutes
     })
 );
 app.use(cookieParser());
@@ -43,12 +40,12 @@ app.get('/', function (req, res) {
 });
 
 app.get('/generate-registration-options', function (req, res) {
-    let input_username = req.body.username;
+    let input_username = req.query.user_name;
     const id = crypto.randomUUID();
     console.log(id);
 
     inMemoryUserDeviceDB[id] = {
-        id: crypto.randomUUID(),
+        id,
         username: `${input_username}@${rpID}`,
         devices: [],
         currentChallenge: undefined,
@@ -65,28 +62,15 @@ app.get('/generate-registration-options', function (req, res) {
         userName: username,
         timeout: 60000,
         attestationType: 'none',
-        /**
-         * Passing in a user's list of already-registered authenticator IDs here prevents users from
-         * registering the same device multiple times. The authenticator will simply throw an error in
-         * the browser if it's asked to perform registration when one of these ID's already resides
-         * on it.
-         */
         excludeCredentials: devices.map((dev) => ({
             id: dev.credentialID,
             type: 'public-key',
             transports: dev.transports,
         })),
-        /**
-         * The optional authenticatorSelection property allows for specifying more constraints around
-         * the types of authenticators that users to can use for registration
-         */
         authenticatorSelection: {
-            userVerification: 'required',
+            userVerification: 'preferred',
             residentKey: 'required',
         },
-        /**
-         * Support the two most common algorithms: ES256, and RS256
-         */
         supportedAlgorithmIDs: [-7, -257],
     });
 
@@ -102,7 +86,6 @@ app.post('/verify-registration', async function (req, res) {
     const id = req.session.id;
 
     const user = inMemoryUserDeviceDB[id];
-    // (Pseudocode) Get `options.challenge` that was saved above
     const expectedChallenge = user.currentChallenge;
 
     let verification;
@@ -112,7 +95,6 @@ app.post('/verify-registration', async function (req, res) {
             expectedChallenge: `${expectedChallenge}`,
             expectedOrigin: 'http://localhost:8000',
             expectedRPID: rpID,
-            requireUserVerification: true,
         };
         verification = await verifyRegistrationResponse(opts);
     } catch (error) {
@@ -131,9 +113,6 @@ app.post('/verify-registration', async function (req, res) {
         );
 
         if (!existingDevice) {
-            /**
-             * Add the returned device to the user's list of devices
-             */
             const newDevice = {
                 credentialPublicKey,
                 credentialID,
@@ -141,10 +120,73 @@ app.post('/verify-registration', async function (req, res) {
                 transports: body.transports,
             };
             user.devices.push(newDevice);
+            inMemoryCredentialDB[credentialID.toString('ascii')] = user.id;
         }
     }
 
     res.send({ verified });
+});
+
+app.get('/generate-authentication-options', (req, res) => {
+    const opts = {
+        timeout: 60000,
+        userVerification: 'preferred',
+        rpID,
+    };
+
+    const options = generateAuthenticationOptions(opts);
+
+    req.session.challenge = options.challenge;
+
+    res.send(options);
+});
+
+app.post('/verify-authentication', (req, res) => {
+    const body = req.body;
+
+    const expectedChallenge = req.session.challenge;
+
+    let dbAuthenticator;
+    const bodyCredIDBuffer = base64url.toBuffer(body.rawId);
+    // "Query the DB" here for an authenticator matching `credentialID`
+    user_id = inMemoryCredentialDB[bodyCredIDBuffer.toString('ascii')];
+
+    if (!user_id) {
+        return res
+            .status(400)
+            .send({ error: 'Authenticator is not registered with this site' });
+    }
+
+    dbAuthenticator = inMemoryUserDeviceDB[user_id].devices.find((dev) =>
+        dev.credentialID.equals(bodyCredIDBuffer)
+    );
+
+    let verification;
+    try {
+        const opts = {
+            credential: body,
+            expectedChallenge: `${expectedChallenge}`,
+            expectedOrigin: 'http://localhost:8000',
+            expectedRPID: rpID,
+            authenticator: dbAuthenticator,
+        };
+        verification = verifyAuthenticationResponse(opts);
+    } catch (error) {
+        const _error = error;
+        console.error(_error);
+        return res.status(400).send({ error: _error.message });
+    }
+
+    const { verified, authenticationInfo } = verification;
+
+    let returnData = { verified };
+
+    if (verified) {
+        dbAuthenticator.counter = authenticationInfo.newCounter;
+        returnData.username = inMemoryUserDeviceDB[user_id].username;
+    }
+
+    res.send(returnData);
 });
 
 app.listen(8000);
